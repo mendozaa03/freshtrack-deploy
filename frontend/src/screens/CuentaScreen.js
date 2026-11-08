@@ -25,7 +25,6 @@ export default function CuentaScreen() {
   const [notifActivas, setNotifActivas] = useState(true);
   const [correoNotif, setCorreoNotif] = useState('');
   const [guardandoNotif, setGuardandoNotif] = useState(false);
-  const [enviandoPrueba, setEnviandoPrueba] = useState(false);
 
   useFocusEffect(
     useCallback(() => {
@@ -55,18 +54,6 @@ export default function CuentaScreen() {
       setNotifActivas(data.notificaciones_activas);
       setCorreoNotif(data.correo_notificaciones || '');
     } catch (_) {}
-  };
-
-  const enviarPrueba = async () => {
-    setEnviandoPrueba(true);
-    try {
-      const { data } = await api.post('/api/v1/alertas/prueba');
-      avisar('Correo enviado', `Se envió un correo de prueba a ${data.mensaje.replace('Correo de prueba enviado a ', '')}.`);
-    } catch (error) {
-      avisar('Error', error.response?.data?.detail || 'No se pudo enviar el correo.');
-    } finally {
-      setEnviandoPrueba(false);
-    }
   };
 
   const guardarNotificaciones = async () => {
@@ -276,16 +263,6 @@ export default function CuentaScreen() {
           Guardar preferencias
         </Button>
 
-        <Button
-          mode="outlined"
-          icon="email-outline"
-          onPress={enviarPrueba}
-          loading={enviandoPrueba}
-          disabled={enviandoPrueba}
-          style={{ marginTop: 8 }}
-        >
-          Enviar notificación de prueba
-        </Button>
       </View>
 
       <Button
