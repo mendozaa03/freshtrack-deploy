@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+freshtrack.db
+*.db
+frontend/node_modules/
+frontend/.expo/
+frontend/dist/
+frontend/web-build/
+.DS_Store
+*.log

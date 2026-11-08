@@ -1,0 +1,803 @@
+"""
+API de FreshTrack — HU-03 · Escanear factura de mercado.
+
+Expone el endpoint que recibe la foto de la factura, la procesa y
+devuelve la lista de productos detectados para que el usuario los
+confirme (eso ya es HU-04).
+"""
+
+import logging
+import time
+import os
+from datetime import date
+from pathlib import Path
+
+# Carga .env si existe (sin dependencias extra)
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        if _line.strip() and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+import cv2
+import numpy as np
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from . import catalogo
+from .alertas import revisar_vencimientos
+from .catalogo import CATALOGO_ALIAS
+from .clasificador import clasificar as clasificar_alimento
+from .matching import asociar_catalogo
+from .ocr import extraer_texto
+from .parser_factura import parsear_factura
+from .auth import fecha_expiracion, hash_password, usuario_actual, validar_correo, verificar_password
+from .storage import conectar, crear_sesion
+from .vision import CONFIANZA_MINIMA, VERSION_MODELO, identificar
+
+logging.basicConfig(level=logging.INFO)
+_scheduler = BackgroundScheduler()
+
+app = FastAPI(
+    title="FreshTrack — OCR de facturas",
+    description="HU-03 · Escanear factura de mercado",
+    version="1.0.0",
+)
+
+
+@app.on_event("startup")
+def _iniciar_scheduler():
+    _scheduler.add_job(
+        revisar_vencimientos,
+        CronTrigger(hour=8, minute=0),
+        id="revision_diaria_vencimientos",
+        replace_existing=True,
+    )
+    _scheduler.start()
+
+
+@app.on_event("shutdown")
+def _detener_scheduler():
+    _scheduler.shutdown(wait=False)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+      origen.strip() for origen in os.getenv("FRESHTRACK_ALLOWED_ORIGINS", "").split(",")
+      if origen.strip()
+    ],
+    allow_origin_regex=(
+        r"https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+):\d+"
+        r"|https://[\w-]+\.(vercel\.app|railway\.app|up\.railway\.app)"
+    ),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TAMANO_MAXIMO = 10 * 1024 * 1024          # 10 MB
+FORMATOS_VALIDOS = {"image/jpeg", "image/png", "image/webp"}
+
+
+# Si el OCR lee con menos confianza que esto, probablemente la foto
+# está muy mala y es mejor pedirle al usuario que la repita.
+CONFIANZA_MINIMA_ACEPTABLE = 0.40
+
+
+class Credenciales(BaseModel):
+  correo: str
+  password: str = Field(min_length=8, max_length=128)
+
+class ActualizacionCuenta(BaseModel):
+  nombre: str | None = Field(default=None, min_length=1, max_length=120)
+  password_actual: str | None = None
+  nueva_password: str | None = Field(default=None, min_length=8, max_length=128)
+
+class PreferenciasNotificacion(BaseModel):
+  notificaciones_activas: bool
+  correo_notificaciones: str | None = Field(default=None, max_length=254)
+
+class ItemInventario(BaseModel):
+  id_alimento: int | None = None
+  nombre: str = Field(min_length=1, max_length=120)
+  cantidad: float = Field(gt=0)
+  unidad: str = Field(default="UND", min_length=1, max_length=10)
+  condicion: str = Field(default="fuera", pattern="^(nevera|fuera)$")
+
+
+class CambioSituacion(BaseModel):
+  situacion: str = Field(pattern="^(consumido|desechado)$")
+
+
+class LineaProducto(BaseModel):
+  id_alimento: int | None = None
+  nombre: str = Field(min_length=1, max_length=120)
+  cantidad: float = Field(gt=0)
+  unidad: str = Field(default="UND", min_length=1, max_length=10)
+  condicion: str = Field(default="fuera", pattern="^(nevera|fuera)$")
+
+
+class ConfirmacionEscaneo(BaseModel):
+  lineas: list[LineaProducto]
+
+
+@app.post("/api/v1/auth/registro", status_code=201)
+def registrar(datos: Credenciales, response: Response):
+  correo = validar_correo(datos.correo)
+  with conectar() as conexion:
+    try:
+      cursor = conexion.execute(
+        "INSERT INTO usuario (correo, hash_password, nombre) VALUES (?, ?, ?)",
+        (correo, hash_password(datos.password), correo.split("@")[0]),
+      )
+    except Exception as error:
+      if "UNIQUE constraint failed" in str(error):
+        raise HTTPException(status_code=409, detail="El correo ya esta registrado")
+      raise
+    token = crear_sesion(conexion, cursor.lastrowid, fecha_expiracion())
+  response.set_cookie("token_sesion", token, max_age=30 * 86400, httponly=True, samesite="none", secure=True)
+  return {"mensaje": "Cuenta creada", "correo": correo}
+
+
+@app.post("/api/v1/auth/login")
+def iniciar_sesion(datos: Credenciales, response: Response):
+  correo = validar_correo(datos.correo)
+  with conectar() as conexion:
+    usuario = conexion.execute(
+      "SELECT id_usuario, hash_password FROM usuario WHERE correo = ?", (correo,)
+    ).fetchone()
+    if usuario is None or not verificar_password(datos.password, usuario["hash_password"]):
+      raise HTTPException(status_code=401, detail="Correo o contrasena incorrectos")
+    token = crear_sesion(conexion, usuario["id_usuario"], fecha_expiracion())
+  response.set_cookie("token_sesion", token, max_age=30 * 86400, httponly=True, samesite="none", secure=True)
+  return {"mensaje": "Sesion iniciada", "correo": correo}
+
+
+@app.post("/api/v1/auth/logout")
+def cerrar_sesion(response: Response, token_sesion: str | None = Cookie(default=None)):
+  if token_sesion:
+    with conectar() as conexion:
+      conexion.execute("DELETE FROM sesion WHERE token = ?", (token_sesion,))
+  response.delete_cookie("token_sesion")
+  return {"mensaje": "Sesion cerrada"}
+
+
+@app.get("/api/v1/auth/me")
+def mi_cuenta(usuario=Depends(usuario_actual)):
+  return dict(usuario)
+
+@app.patch("/api/v1/auth/me")
+def actualizar_cuenta(datos: ActualizacionCuenta, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    if datos.nueva_password:
+      if not datos.password_actual:
+        raise HTTPException(status_code=422, detail="Debe ingresar su contrasena actual")
+      fila = conexion.execute(
+        "SELECT hash_password FROM usuario WHERE id_usuario = ?", (usuario["id_usuario"],)
+      ).fetchone()
+      if not verificar_password(datos.password_actual, fila["hash_password"]):
+        raise HTTPException(status_code=401, detail="La contrasena actual no es correcta")
+      conexion.execute(
+        "UPDATE usuario SET hash_password = ? WHERE id_usuario = ?",
+        (hash_password(datos.nueva_password), usuario["id_usuario"]),
+      )
+    if datos.nombre:
+      conexion.execute(
+        "UPDATE usuario SET nombre = ? WHERE id_usuario = ?",
+        (datos.nombre.strip(), usuario["id_usuario"]),
+      )
+    fila = conexion.execute(
+      "SELECT id_usuario, correo, nombre FROM usuario WHERE id_usuario = ?",
+      (usuario["id_usuario"],),
+    ).fetchone()
+  return dict(fila)
+
+@app.get("/api/v1/perfil/notificaciones")
+def obtener_preferencias_notificacion(usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    fila = conexion.execute(
+      "SELECT notificaciones_activas, correo_notificaciones FROM usuario WHERE id_usuario = ?",
+      (usuario["id_usuario"],),
+    ).fetchone()
+  return {
+    "notificaciones_activas": bool(fila["notificaciones_activas"]),
+    "correo_notificaciones": fila["correo_notificaciones"],
+  }
+
+@app.patch("/api/v1/perfil/notificaciones")
+def actualizar_preferencias_notificacion(datos: PreferenciasNotificacion, usuario=Depends(usuario_actual)):
+  correo = datos.correo_notificaciones.strip() if datos.correo_notificaciones else None
+  with conectar() as conexion:
+    conexion.execute(
+      "UPDATE usuario SET notificaciones_activas = ?, correo_notificaciones = ? WHERE id_usuario = ?",
+      (1 if datos.notificaciones_activas else 0, correo, usuario["id_usuario"]),
+    )
+  return {"notificaciones_activas": datos.notificaciones_activas, "correo_notificaciones": correo}
+
+
+@app.get("/api/v1/inventario")
+def listar_inventario(usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    filas = conexion.execute(
+      "SELECT id_item, id_alimento, nombre, cantidad, unidad, condicion, situacion, "
+      "fecha_vencimiento_est FROM item_inventario "
+      "WHERE id_usuario = ? AND situacion = 'activo' "
+      "ORDER BY fecha_vencimiento_est IS NULL, fecha_vencimiento_est, id_item DESC",
+      (usuario["id_usuario"],),
+    ).fetchall()
+  return {"items": [dict(fila) for fila in filas]}
+
+
+def _receta_dict(fila, disponibles):
+  ingredientes = [int(valor) for valor in (fila["ingredientes"] or "").split(",") if valor]
+  disponibles_ids = {item["id_alimento"] for item in disponibles if item["id_alimento"] is not None}
+  nombres = {item["id_alimento"]: item["nombre"] for item in disponibles}
+  disponibles_receta = [nombres[aid] for aid in ingredientes if aid in disponibles_ids]
+  faltantes = [catalogo.obtener(aid)["nombre"] for aid in ingredientes
+               if aid not in disponibles_ids and catalogo.obtener(aid)]
+  return {
+    "id_receta": fila["id_receta"],
+    "titulo": fila["titulo"],
+    "minutos_prep": fila["minutos_prep"],
+    "porciones": fila["porciones"],
+    "pasos": fila["pasos"],
+    "imagen_url": (
+      "https://images.unsplash.com/photo-1498837167922-ddd27525d352"
+      "?auto=format&fit=crop&w=900&q=80"
+    ),
+    "fuente": "FreshTrack",
+    "ingredientes": [catalogo.obtener(aid)["nombre"] for aid in ingredientes if catalogo.obtener(aid)],
+    "ingrediente_ids": ingredientes,
+    "disponibles": disponibles_receta,
+    "faltantes": faltantes,
+    "cobertura": round(len(disponibles_receta) / len(ingredientes), 2) if ingredientes else 0,
+  }
+
+
+@app.get("/api/v1/recetas")
+def listar_recetas(
+  q: str | None = None,
+  id_item: int | None = None,
+  usuario=Depends(usuario_actual),
+):
+  """Recomienda recetas según los alimentos activos del usuario."""
+  with conectar() as conexion:
+    disponibles = [dict(fila) for fila in conexion.execute(
+      "SELECT DISTINCT id_alimento, nombre FROM item_inventario "
+      "WHERE id_usuario = ? AND situacion = 'activo'", (usuario["id_usuario"],)
+    ).fetchall()]
+    item_prioritario = None
+    if id_item is not None:
+      item_prioritario = conexion.execute(
+        "SELECT id_item, id_alimento, nombre FROM item_inventario "
+        "WHERE id_item = ? AND id_usuario = ? AND situacion = 'activo'",
+        (id_item, usuario["id_usuario"]),
+      ).fetchone()
+    filas = conexion.execute(
+      "SELECT r.id_receta, r.titulo, r.minutos_prep, r.porciones, r.pasos, "
+      "GROUP_CONCAT(ri.id_alimento) AS ingredientes "
+      "FROM receta r JOIN receta_ingrediente ri ON ri.id_receta = r.id_receta "
+      "GROUP BY r.id_receta ORDER BY r.id_receta"
+    ).fetchall()
+  recetas = [_receta_dict(fila, disponibles) for fila in filas]
+  if id_item is not None:
+    if item_prioritario is None:
+      raise HTTPException(status_code=404, detail="Producto no encontrado en tu inventario activo")
+    recetas = [
+      receta for receta in recetas
+      if item_prioritario["id_alimento"] in receta["ingrediente_ids"]
+    ]
+  if q and q.strip():
+    termino = q.strip().casefold()
+    recetas = [receta for receta in recetas if termino in receta["titulo"].casefold()
+               or any(termino in ingrediente.casefold() for ingrediente in receta["ingredientes"])]
+  recetas.sort(key=lambda receta: (-receta["cobertura"], len(receta["faltantes"]), receta["titulo"]))
+  if id_item is not None:
+    recetas = recetas[:5]
+  return {
+    "recetas": recetas,
+    "total": len(recetas),
+    "producto_prioritario": (
+      item_prioritario["nombre"]
+      if id_item is not None and item_prioritario is not None else None
+    ),
+  }
+
+
+@app.get("/api/v1/recetas/{id_receta}")
+def ver_receta(id_receta: int, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    fila = conexion.execute(
+      "SELECT r.id_receta, r.titulo, r.minutos_prep, r.porciones, r.pasos, "
+      "GROUP_CONCAT(ri.id_alimento) AS ingredientes "
+      "FROM receta r JOIN receta_ingrediente ri ON ri.id_receta = r.id_receta "
+      "WHERE r.id_receta = ? GROUP BY r.id_receta", (id_receta,)
+    ).fetchone()
+    disponibles = [dict(item) for item in conexion.execute(
+      "SELECT DISTINCT id_alimento, nombre FROM item_inventario "
+      "WHERE id_usuario = ? AND situacion = 'activo'", (usuario["id_usuario"],)
+    ).fetchall()]
+  if fila is None:
+    raise HTTPException(status_code=404, detail="Receta no encontrada")
+  return _receta_dict(fila, disponibles)
+
+
+class AccionReceta(BaseModel):
+  accion: str = Field(pattern="^(vista|usada|descartada)$")
+
+
+@app.post("/api/v1/recetas/{id_receta}/accion", status_code=201)
+def registrar_accion_receta(id_receta: int, datos: AccionReceta, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    existe = conexion.execute("SELECT 1 FROM receta WHERE id_receta = ?", (id_receta,)).fetchone()
+    if existe is None:
+      raise HTTPException(status_code=404, detail="Receta no encontrada")
+    columnas = {fila["name"] for fila in conexion.execute("PRAGMA table_info(sugerencia_receta)")}
+    if "id_item" in columnas:
+      item = conexion.execute(
+        """SELECT i.id_item
+           FROM item_inventario i
+           JOIN receta_ingrediente ri ON ri.id_alimento = i.id_alimento
+           WHERE i.id_usuario = ? AND i.situacion = 'activo' AND ri.id_receta = ?
+           ORDER BY i.fecha_vencimiento_est IS NULL, i.fecha_vencimiento_est
+           LIMIT 1""",
+        (usuario["id_usuario"], id_receta),
+      ).fetchone()
+      if item is None:
+        raise HTTPException(
+          status_code=422,
+          detail="Necesitas tener al menos un ingrediente activo para registrar esta acción",
+        )
+      conexion.execute(
+        "INSERT INTO sugerencia_receta (id_usuario, id_item, id_receta, accion) VALUES (?, ?, ?, ?)",
+        (usuario["id_usuario"], item["id_item"], id_receta, datos.accion),
+      )
+    else:
+      conexion.execute(
+        "INSERT INTO sugerencia_receta (id_usuario, id_receta, accion) VALUES (?, ?, ?)",
+        (usuario["id_usuario"], id_receta, datos.accion),
+      )
+  return {"mensaje": "Acción registrada"}
+
+
+@app.get("/api/v1/catalogo")
+def buscar_catalogo(q: str, usuario=Depends(usuario_actual)):
+  return {"resultados": catalogo.buscar(q)}
+
+
+@app.post("/api/v1/inventario", status_code=201)
+def agregar_inventario(item: ItemInventario, usuario=Depends(usuario_actual)):
+  hoy = date.today()
+  aviso = None
+  vencimiento = None
+  info = None
+  if item.id_alimento is not None:
+    info = catalogo.obtener(item.id_alimento)
+    if info is None:
+      raise HTTPException(status_code=404, detail="El alimento no esta en el catalogo")
+    vencimiento = catalogo.calcular_vencimiento(item.id_alimento, item.condicion, hoy)
+  else:
+    aviso = ("Este producto no esta en el catalogo, no se pudo calcular "
+             "una fecha de vencimiento estimada.")
+  nombre = info["nombre"] if info else item.nombre.strip()
+  vencimiento_iso = vencimiento.isoformat() if vencimiento else None
+  with conectar() as conexion:
+    fila = conexion.execute(
+      "INSERT INTO item_inventario "
+      "(id_usuario, id_alimento, nombre, cantidad, unidad, condicion, fecha_vencimiento_est) "
+      "VALUES (?, ?, ?, ?, ?, ?, ?) "
+      "RETURNING id_item, id_alimento, nombre, cantidad, unidad, condicion, "
+      "situacion, fecha_vencimiento_est",
+      (usuario["id_usuario"], item.id_alimento, nombre, item.cantidad,
+       item.unidad.upper(), item.condicion, vencimiento_iso),
+    ).fetchone()
+  resultado = dict(fila)
+  if aviso:
+    resultado["aviso"] = aviso
+  return resultado
+
+
+@app.patch("/api/v1/inventario/{id_item}")
+def cambiar_situacion(id_item: int, cambio: CambioSituacion,
+                      usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    cursor = conexion.execute(
+      "UPDATE item_inventario SET situacion = ?, fecha_cierre = CURRENT_DATE "
+      "WHERE id_item = ? AND id_usuario = ? AND situacion = 'activo'",
+      (cambio.situacion, id_item, usuario["id_usuario"]),
+    )
+    if cursor.rowcount == 0:
+      raise HTTPException(status_code=404, detail="Producto no encontrado o ya cerrado")
+    fila = conexion.execute(
+      "SELECT id_item, nombre, cantidad, unidad, condicion, situacion, fecha_vencimiento_est "
+      "FROM item_inventario WHERE id_item = ?", (id_item,)
+    ).fetchone()
+  return dict(fila)
+
+
+def _linea_dict(fila):
+  return {
+    "id_linea": fila["id_linea"],
+    "texto_crudo": fila["texto_crudo"],
+    "id_alimento_sugerido": fila["id_alimento_sugerido"],
+    "nombre": fila["nombre"],
+    "cantidad": fila["cantidad"],
+    "unidad": fila["unidad"],
+    "confianza": fila["confianza"],
+    "condicion": fila["condicion"],
+    "confirmada": bool(fila["confirmada"]),
+    "en_catalogo": fila["id_alimento_sugerido"] is not None,
+  }
+
+
+def _obtener_escaneo(conexion, id_escaneo, id_usuario):
+  escaneo = conexion.execute(
+    "SELECT id_escaneo FROM escaneo_borrador WHERE id_escaneo = ? AND id_usuario = ?",
+    (id_escaneo, id_usuario),
+  ).fetchone()
+  if escaneo is None:
+    raise HTTPException(status_code=404, detail="Escaneo no encontrado")
+  return escaneo
+
+
+@app.get("/api/v1/escaneos/{id_escaneo}")
+def ver_escaneo(id_escaneo: int, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    _obtener_escaneo(conexion, id_escaneo, usuario["id_usuario"])
+    filas = conexion.execute(
+      "SELECT * FROM linea_detectada WHERE id_escaneo = ? ORDER BY id_linea", (id_escaneo,)
+    ).fetchall()
+  return {"id_escaneo": id_escaneo, "lineas": [_linea_dict(fila) for fila in filas]}
+
+
+@app.put("/api/v1/escaneos/{id_escaneo}/lineas/{id_linea}")
+def editar_linea(id_escaneo: int, id_linea: int, cambios: LineaProducto,
+                 usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    _obtener_escaneo(conexion, id_escaneo, usuario["id_usuario"])
+    cursor = conexion.execute(
+      """UPDATE linea_detectada SET nombre = ?, cantidad = ?, unidad = ?, condicion = ?,
+         confirmada = 0 WHERE id_linea = ? AND id_escaneo = ?""",
+      (cambios.nombre.strip(), cambios.cantidad, cambios.unidad.upper(),
+       cambios.condicion, id_linea, id_escaneo),
+    )
+    if cursor.rowcount == 0:
+      raise HTTPException(status_code=404, detail="Linea no encontrada")
+    fila = conexion.execute("SELECT * FROM linea_detectada WHERE id_linea = ?", (id_linea,)).fetchone()
+  return _linea_dict(fila)
+
+
+@app.delete("/api/v1/escaneos/{id_escaneo}/lineas/{id_linea}", status_code=204)
+def eliminar_linea(id_escaneo: int, id_linea: int, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    _obtener_escaneo(conexion, id_escaneo, usuario["id_usuario"])
+    cursor = conexion.execute(
+      "DELETE FROM linea_detectada WHERE id_linea = ? AND id_escaneo = ?", (id_linea, id_escaneo)
+    )
+    if cursor.rowcount == 0:
+      raise HTTPException(status_code=404, detail="Linea no encontrada")
+  return Response(status_code=204)
+
+
+@app.post("/api/v1/escaneos/{id_escaneo}/lineas", status_code=201)
+def agregar_linea(id_escaneo: int, linea: LineaProducto, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    _obtener_escaneo(conexion, id_escaneo, usuario["id_usuario"])
+    fila = conexion.execute(
+      """INSERT INTO linea_detectada
+         (id_escaneo, texto_crudo, nombre, cantidad, unidad, condicion)
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING *""",
+      (id_escaneo, linea.nombre, linea.nombre.strip(), linea.cantidad,
+       linea.unidad.upper(), linea.condicion),
+    ).fetchone()
+  return _linea_dict(fila)
+
+
+@app.post("/api/v1/escaneos/{id_escaneo}/confirmar")
+def confirmar_escaneo(id_escaneo: int, datos: ConfirmacionEscaneo,
+                      usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    _obtener_escaneo(conexion, id_escaneo, usuario["id_usuario"])
+    existentes = conexion.execute(
+      "SELECT id_linea, texto_crudo, id_alimento_sugerido FROM linea_detectada "
+      "WHERE id_escaneo = ? ORDER BY id_linea",
+      (id_escaneo,),
+    ).fetchall()
+    if len(existentes) != len(datos.lineas):
+      raise HTTPException(status_code=400, detail="La lista de confirmacion no coincide con el escaneo")
+    items_creados = 0
+    for fila, linea in zip(existentes, datos.lineas):
+      nombre = linea.nombre.strip()
+      unidad = linea.unidad.upper()
+      id_alimento = linea.id_alimento or fila["id_alimento_sugerido"]
+      if id_alimento is not None and catalogo.obtener(id_alimento) is None:
+        raise HTTPException(status_code=404, detail="El alimento no esta en el catalogo")
+      vencimiento = (catalogo.calcular_vencimiento(id_alimento, linea.condicion, date.today())
+                     if id_alimento is not None else None)
+      conexion.execute(
+        "UPDATE linea_detectada SET nombre = ?, cantidad = ?, unidad = ?, condicion = ?, confirmada = 1 "
+        "WHERE id_linea = ?",
+        (nombre, linea.cantidad, unidad, linea.condicion, fila["id_linea"]),
+      )
+      conexion.execute(
+        "INSERT INTO item_inventario "
+        "(id_usuario, id_alimento, nombre, cantidad, unidad, condicion, "
+        "fecha_vencimiento_est, id_escaneo) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (usuario["id_usuario"], id_alimento, nombre, linea.cantidad, unidad,
+         linea.condicion, vencimiento.isoformat() if vencimiento else None, id_escaneo),
+      )
+      items_creados += 1
+      _guardar_correccion(conexion, usuario["id_usuario"], fila["texto_crudo"], nombre)
+  return {"mensaje": "Productos confirmados", "id_escaneo": id_escaneo,
+          "total": len(datos.lineas), "items_creados": items_creados}
+
+
+def _cargar_correcciones(conexion, id_usuario):
+  """Devuelve {texto_crudo: nombre_corregido} para aplicar a nuevos escaneos."""
+  filas = conexion.execute(
+    "SELECT texto_crudo, nombre_corregido FROM correccion_alias WHERE id_usuario = ?",
+    (id_usuario,),
+  ).fetchall()
+  return {fila["texto_crudo"]: fila["nombre_corregido"] for fila in filas}
+
+
+def _guardar_correccion(conexion, id_usuario, texto_crudo, nombre_final):
+  """Aprende que este texto de factura corresponde a este producto para el usuario."""
+  texto = (texto_crudo or "").strip()
+  nombre = (nombre_final or "").strip()
+  if not texto or not nombre:
+    return
+  conexion.execute(
+    """INSERT INTO correccion_alias (id_usuario, texto_crudo, nombre_corregido)
+       VALUES (?, ?, ?)
+       ON CONFLICT(id_usuario, texto_crudo) DO UPDATE SET
+         nombre_corregido = excluded.nombre_corregido,
+         veces = correccion_alias.veces + 1,
+         actualizado_en = CURRENT_TIMESTAMP""",
+    (id_usuario, texto, nombre),
+  )
+
+
+def _leer_imagen(contenido):
+    """Convierte los bytes recibidos en una imagen de OpenCV."""
+    arreglo = np.frombuffer(contenido, np.uint8)
+    imagen = cv2.imdecode(arreglo, cv2.IMREAD_COLOR)
+    if imagen is None:
+        raise HTTPException(status_code=400, detail="La imagen no se pudo leer o está dañada")
+    return imagen
+
+
+@app.get("/salud")
+def salud():
+    """Verifica que el servicio esté arriba."""
+    return {"estado": "ok"}
+
+
+@app.post("/api/v1/alimentos/clasificar")
+async def clasificar_foto(archivo: UploadFile = File(...), usuario=Depends(usuario_actual)):
+    """Recibe la foto de un alimento y devuelve si está fresco o dañado."""
+    if archivo.content_type not in FORMATOS_VALIDOS:
+        raise HTTPException(status_code=400,
+            detail=f"Formato no soportado: {archivo.content_type}. Use JPG, PNG o WEBP.")
+
+    contenido = await archivo.read()
+    if len(contenido) > TAMANO_MAXIMO:
+        raise HTTPException(status_code=413, detail="La imagen supera los 10 MB")
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo llegó vacío")
+
+    imagen = _leer_imagen(contenido)
+    try:
+        resultado = clasificar_alimento(imagen)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return resultado
+
+
+@app.post("/api/v1/facturas/escanear")
+async def escanear_factura(archivo: UploadFile = File(...), usuario=Depends(usuario_actual)):
+    """Recibe la foto de una factura y devuelve los productos detectados."""
+    if archivo.content_type not in FORMATOS_VALIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado: {archivo.content_type}. Use JPG, PNG o WEBP.",
+        )
+
+    contenido = await archivo.read()
+    if len(contenido) > TAMANO_MAXIMO:
+        raise HTTPException(status_code=413, detail="La imagen supera los 10 MB")
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo llegó vacío")
+
+    inicio = time.time()
+
+    imagen = _leer_imagen(contenido)
+    resultado_ocr = extraer_texto(imagen)
+    candidatos = parsear_factura(resultado_ocr["texto"])
+    productos = asociar_catalogo(candidatos, CATALOGO_ALIAS)
+
+    duracion = round(time.time() - inicio, 2)
+
+    # Aviso para la app: si la lectura salió mala, conviene repetir la foto
+    advertencia = None
+    if resultado_ocr["confianza"] < CONFIANZA_MINIMA_ACEPTABLE:
+        advertencia = "La foto se leyó con dificultad. Intente de nuevo con mejor luz."
+    elif not productos:
+        advertencia = "No se detectaron productos en la factura."
+
+    with conectar() as conexion:
+      correcciones = _cargar_correcciones(conexion, usuario["id_usuario"])
+      escaneo = conexion.execute(
+        "INSERT INTO escaneo_borrador (id_usuario, texto_ocr) VALUES (?, ?) RETURNING id_escaneo",
+        (usuario["id_usuario"], resultado_ocr["texto"]),
+      ).fetchone()
+      id_escaneo = escaneo["id_escaneo"]
+      for producto in productos:
+        aprendida = correcciones.get((producto["texto_crudo"] or "").strip())
+        if aprendida:
+          producto["nombre_sugerido"] = aprendida
+          producto["confianza"] = max(producto["confianza"], 0.95)
+          producto["confirmado"] = True
+        conexion.execute(
+          """INSERT INTO linea_detectada
+             (id_escaneo, texto_crudo, id_alimento_sugerido, nombre, cantidad, unidad, confianza)
+             VALUES (?, ?, ?, ?, ?, ?, ?)""",
+          (id_escaneo, producto["texto_crudo"], producto["id_alimento_sugerido"],
+           producto["nombre_sugerido"] or producto["descripcion"], producto["cantidad"],
+           producto["unidad"], producto["confianza"]),
+        )
+
+    return {
+      "id_escaneo": id_escaneo,
+        "confianza_ocr": resultado_ocr["confianza"],
+        "variante_usada": resultado_ocr["variante"],
+        "segundos": duracion,
+        "total_detectados": len(productos),
+        "advertencia": advertencia,
+        "productos": [
+            {
+                "numero_linea": p["numero_linea"],
+                "texto_crudo": p["texto_crudo"],
+                "id_alimento_sugerido": p["id_alimento_sugerido"],
+                "nombre_sugerido": p["nombre_sugerido"],
+                "cantidad": p["cantidad"],
+                "unidad": p["unidad"],
+                "confianza": p["confianza"],
+                "confirmado": p["confirmado"],
+                "en_catalogo": p["id_alimento_sugerido"] is not None,
+            }
+            for p in productos
+        ],
+    }
+
+
+@app.post("/api/v1/camara/identificar")
+async def identificar_alimento(archivo: UploadFile = File(...), usuario=Depends(usuario_actual)):
+  """Identifica un alimento fotografiado y guarda también los intentos fallidos."""
+  if archivo.content_type not in FORMATOS_VALIDOS:
+    raise HTTPException(status_code=400, detail="Formato no soportado. Use JPG, PNG o WEBP.")
+  contenido = await archivo.read()
+  if not contenido:
+    raise HTTPException(status_code=400, detail="El archivo llegó vacío")
+  if len(contenido) > TAMANO_MAXIMO:
+    raise HTTPException(status_code=413, detail="La imagen supera los 10 MB")
+  try:
+    resultado = identificar(contenido)
+  except FileNotFoundError as error:
+    raise HTTPException(status_code=503, detail=str(error)) from error
+  except (RuntimeError, ValueError) as error:
+    raise HTTPException(status_code=422, detail=str(error)) from error
+
+  with conectar() as conexion:
+    fila = conexion.execute(
+      """INSERT INTO identificacion_camara
+         (id_usuario, nombre, estado, confianza, reconocido, clase_modelo, version_modelo)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id_identificacion""",
+      (usuario["id_usuario"], resultado["nombre"], resultado["estado"],
+       resultado["confianza"], int(resultado["reconocido"]), resultado["clase"], VERSION_MODELO),
+    ).fetchone()
+
+  if resultado["reconocido"] and resultado["repetir"]:
+    mensaje = "La confianza es baja. Repite la foto con mejor luz y encuadre."
+  elif resultado["reconocido"]:
+    mensaje = "Identificación aceptada."
+  else:
+    mensaje = "No reconocemos ese alimento. Puedes registrarlo manualmente."
+  return {
+    **resultado,
+    "id_identificacion": fila["id_identificacion"],
+    "confianza_minima": CONFIANZA_MINIMA,
+    "mensaje": mensaje,
+  }
+
+
+@app.get("/api/v1/notificaciones")
+def listar_notificaciones(usuario=Depends(usuario_actual)):
+  """Devuelve las notificaciones no leídas del usuario."""
+  with conectar() as conexion:
+    filas = conexion.execute(
+      """SELECT id_notificacion, id_item, tipo, mensaje, fecha_generada, leida
+         FROM notificacion
+         WHERE id_usuario = ?
+         ORDER BY fecha_generada DESC, id_notificacion DESC""",
+      (usuario["id_usuario"],),
+    ).fetchall()
+  return {"notificaciones": [dict(fila) for fila in filas]}
+
+
+@app.patch("/api/v1/notificaciones/{id_notificacion}/leer", status_code=204)
+def marcar_leida(id_notificacion: int, usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    cursor = conexion.execute(
+      "UPDATE notificacion SET leida = 1 WHERE id_notificacion = ? AND id_usuario = ?",
+      (id_notificacion, usuario["id_usuario"]),
+    )
+    if cursor.rowcount == 0:
+      raise HTTPException(status_code=404, detail="Notificación no encontrada")
+  return Response(status_code=204)
+
+
+@app.post("/api/v1/alertas/revisar", status_code=200)
+def disparar_revision(usuario=Depends(usuario_actual)):
+  """Dispara manualmente el proceso de revisión de vencimientos."""
+  try:
+    generadas = revisar_vencimientos()
+  except Exception as exc:
+    raise HTTPException(status_code=500, detail="Error al revisar vencimientos") from exc
+  return {"mensaje": "Revisión completada", "notificaciones_generadas": generadas}
+
+
+@app.post("/api/v1/alertas/prueba", status_code=200)
+def enviar_notificacion_prueba(usuario=Depends(usuario_actual)):
+  """Envía un correo de prueba al usuario con todos sus productos activos que tienen fecha de vencimiento."""
+  from datetime import date
+  from .alertas import _enviar_email
+  id_usuario = usuario["id_usuario"]
+  with conectar() as conexion:
+    fila_usuario = conexion.execute(
+      "SELECT correo, correo_notificaciones FROM usuario WHERE id_usuario = ?", (id_usuario,)
+    ).fetchone()
+    items = conexion.execute(
+      """SELECT nombre, fecha_vencimiento_est FROM item_inventario
+         WHERE id_usuario = ? AND situacion = 'activo' AND fecha_vencimiento_est IS NOT NULL
+         ORDER BY fecha_vencimiento_est""",
+      (id_usuario,),
+    ).fetchall()
+  if not items:
+    raise HTTPException(status_code=404, detail="No tienes productos con fecha de vencimiento registrada.")
+  hoy = date.today()
+  mensajes = []
+  for item in items:
+    dias = (date.fromisoformat(item["fecha_vencimiento_est"]) - hoy).days
+    if dias < 0:
+      mensajes.append(f"{item['nombre']} venció hace {abs(dias)} día(s).")
+    elif dias == 0:
+      mensajes.append(f"{item['nombre']} vence hoy.")
+    elif dias == 1:
+      mensajes.append(f"{item['nombre']} vence mañana.")
+    else:
+      mensajes.append(f"{item['nombre']} vence en {dias} días.")
+  destino = fila_usuario["correo_notificaciones"] or fila_usuario["correo"]
+  _enviar_email(destino, mensajes)
+  return {"mensaje": f"Correo de prueba enviado a {destino}", "items": len(mensajes)}
+
+
+@app.get("/api/v1/camara/alimentos")
+def alimentos_reconocibles(usuario=Depends(usuario_actual)):
+  """Lista los alimentos que el modelo puede identificar."""
+  return {"alimentos": ["Banano", "Manzana", "Naranja", "Tomate", "Pepino", "Pimentón", "Papa"]}
+
+
+@app.get("/api/v1/camara/historial")
+def historial_camara(usuario=Depends(usuario_actual)):
+  with conectar() as conexion:
+    filas = conexion.execute(
+      "SELECT * FROM identificacion_camara WHERE id_usuario = ? ORDER BY creado_en DESC",
+      (usuario["id_usuario"],),
+    ).fetchall()
+  return {"identificaciones": [dict(fila) for fila in filas]}
