@@ -7,7 +7,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Cookie, HTTPException
+from fastapi import Cookie, HTTPException, Request
 
 from .storage import conectar
 
@@ -48,7 +48,10 @@ def fecha_expiracion():
     return (datetime.now(timezone.utc) + timedelta(days=SESION_DIAS)).isoformat()
 
 
-def usuario_actual(token_sesion: str | None = Cookie(default=None)):
+def usuario_actual(request: Request, token_sesion: str | None = Cookie(default=None)):
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token_sesion = auth_header[7:]
     if not token_sesion:
         raise HTTPException(status_code=401, detail="Debe iniciar sesion")
 

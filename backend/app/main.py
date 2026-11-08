@@ -140,7 +140,7 @@ def registrar(datos: Credenciales, response: Response):
       raise
     token = crear_sesion(conexion, cursor.lastrowid, fecha_expiracion())
   response.set_cookie("token_sesion", token, max_age=30 * 86400, httponly=True, samesite="none", secure=True)
-  return {"mensaje": "Cuenta creada", "correo": correo}
+  return {"mensaje": "Cuenta creada", "correo": correo, "token": token}
 
 
 @app.post("/api/v1/auth/login")
@@ -154,7 +154,7 @@ def iniciar_sesion(datos: Credenciales, response: Response):
       raise HTTPException(status_code=401, detail="Correo o contrasena incorrectos")
     token = crear_sesion(conexion, usuario["id_usuario"], fecha_expiracion())
   response.set_cookie("token_sesion", token, max_age=30 * 86400, httponly=True, samesite="none", secure=True)
-  return {"mensaje": "Sesion iniciada", "correo": correo}
+  return {"mensaje": "Sesion iniciada", "correo": correo, "token": token}
 
 
 @app.post("/api/v1/auth/logout")

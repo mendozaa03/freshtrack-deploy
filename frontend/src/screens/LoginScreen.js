@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { View, Text, StyleSheet, ImageBackground, ScrollView, ActivityIndicator } from 'react-native';
 import { TextInput, Button } from 'react-native-paper';
-import { api } from '../services/api';
+import { api, guardarToken } from '../services/api';
 import { colores, fuentes, sombras } from '../theme/theme';
 import { mensajeDeError } from '../utils/errores';
 
@@ -20,7 +20,8 @@ export default function LoginScreen({ navigation }) {
     }
     setCargando(true);
     try {
-      await api.post('/api/v1/auth/login', { correo, password });
+      const resp = await api.post('/api/v1/auth/login', { correo, password });
+      guardarToken(resp.data.token);
       navigation.replace('Main');
     } catch (error) {
       setErrorMensaje(mensajeDeError(error));

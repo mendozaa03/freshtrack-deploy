@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { View, StyleSheet, Platform, ScrollView, Switch } from 'react-native';
 import { Text, TextInput, Button, ActivityIndicator, Divider, List } from 'react-native-paper';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
-import { api } from '../services/api';
+import { api, borrarToken } from '../services/api';
 import { avisar } from '../utils/avisar';
 import { colores, fuentes, sombras } from '../theme/theme';
 
@@ -141,6 +141,7 @@ export default function CuentaScreen() {
     } catch (error) {
       // igual sacamos al usuario aunque falle la llamada
     } finally {
+      borrarToken();
       setCerrando(false);
       navigation.getParent()?.reset({ index: 0, routes: [{ name: 'Login' }] });
     }
