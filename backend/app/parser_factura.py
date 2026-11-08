@@ -67,7 +67,7 @@ PATRON_UNIDAD = re.compile(
 # Líneas de peso en facturas del Éxito: "1 0.775/KGM × 4.680 V.Ahorro 0"
 # El OCR puede leer "." como "-" o "," y "KGM" como "KGH", "KGA", etc.
 # No ponemos \b al final porque el OCR a veces pega un guión/underscore: "KGM_x".
-PATRON_KGM = re.compile(r"(\d+[-.,]\d+)\s*/\s*KG", re.IGNORECASE)
+PATRON_KGM = re.compile(r"(?<!\d)(\d+[-.,]\d+)\s*/\s*KG", re.IGNORECASE)
 
 # "V.Ahorro" / "V.Ahorra" identifica líneas de peso del Éxito incluso cuando
 # el OCR arruinó la parte "/KGM" (p.ej. la lee como "S x" por una arruga).
