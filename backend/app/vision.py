@@ -52,15 +52,12 @@ def _cargar_interprete():
             "Prepara el entorno con: python ml/scripts/preparar_modelo.py"
         )
     try:
-        from ai_edge_litert.interpreter import Interpreter
+        from tflite_runtime.interpreter import Interpreter
     except ImportError:
         try:
-            from tflite_runtime.interpreter import Interpreter
-        except ImportError:
-            try:
-                from tensorflow.lite.python.interpreter import Interpreter
-            except ImportError as error:
-                raise RuntimeError("Instala ai-edge-litert, tflite-runtime o tensorflow para usar la cámara") from error
+            from tensorflow.lite.python.interpreter import Interpreter
+        except ImportError as error:
+            raise RuntimeError("Instala tflite-runtime o tensorflow para usar la cámara") from error
 
     _INTERPRETER = Interpreter(model_path=str(ruta_modelo))
     _INTERPRETER.allocate_tensors()
