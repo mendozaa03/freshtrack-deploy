@@ -692,6 +692,8 @@ async def identificar_alimento(archivo: UploadFile = File(...), usuario=Depends(
     raise HTTPException(status_code=503, detail=str(error)) from error
   except (RuntimeError, ValueError) as error:
     raise HTTPException(status_code=422, detail=str(error)) from error
+  except Exception as error:
+    raise HTTPException(status_code=503, detail=f"El modelo de cámara no está disponible: {error}") from error
 
   with conectar() as conexion:
     fila = conexion.execute(
