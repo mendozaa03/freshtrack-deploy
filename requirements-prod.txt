@@ -3,7 +3,7 @@ uvicorn[standard]==0.32.*
 python-multipart==0.0.*
 pytesseract==0.3.*
 opencv-python-headless==4.*
-numpy==2.*
+numpy>=1.24,<2.0
 pillow==11.*
 apscheduler>=3.10,<4.0
 tflite-runtime
