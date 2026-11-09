@@ -21,7 +21,7 @@ export default function EscanearAlimentoScreen() {
         </Text>
         <Text style={styles.mensaje}>
           No está disponible en esta versión web de la demo.{'\n'}
-          Pídele a los expositores que te la muestren en el celular. 🙌
+          Pídele a los expositores que te la muestren en el celular.
         </Text>
       </View>
     </View>
