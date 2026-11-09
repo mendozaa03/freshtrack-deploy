@@ -24,26 +24,43 @@ _INTERPRETER = None
 _CLASES = None
 
 
+def _buscar_modelo():
+    """Busca el modelo en varias rutas posibles (Railway y desarrollo)."""
+    this = Path(__file__).resolve()
+    candidatos = [
+        this.parents[1] / "ml" / "modelos" / "modelo.tflite",   # Railway: /app/ml/modelos/
+        this.parents[2] / "ml" / "modelos" / "modelo.tflite",   # dev: {proyecto}/ml/modelos/
+        this.parents[3] / "ml" / "modelos" / "modelo.tflite",
+    ]
+    for c in candidatos:
+        if c.exists():
+            return c
+    return candidatos[0]
+
+
 def _cargar_interprete():
     global _INTERPRETER, _CLASES
     if _INTERPRETER is not None:
         return _INTERPRETER, _CLASES
 
-    raiz_proyecto = Path(__file__).resolve().parents[2]
-    ruta_modelo = Path(os.getenv("FRESHTRACK_MODELO", str(raiz_proyecto / "ml/modelos/modelo.tflite")))
-    ruta_clases = Path(os.getenv("FRESHTRACK_CLASES", str(raiz_proyecto / "ml/modelos/clases.json")))
+    ruta_default = _buscar_modelo()
+    ruta_modelo = Path(os.getenv("FRESHTRACK_MODELO", str(ruta_default)))
+    ruta_clases = Path(os.getenv("FRESHTRACK_CLASES", str(ruta_modelo.parent / "clases.json")))
     if not ruta_modelo.exists():
         raise FileNotFoundError(
             f"No existe el modelo de cámara en {ruta_modelo}. "
             "Prepara el entorno con: python ml/scripts/preparar_modelo.py"
         )
     try:
-        from tflite_runtime.interpreter import Interpreter
+        from ai_edge_litert.interpreter import Interpreter
     except ImportError:
         try:
-            from tensorflow.lite.python.interpreter import Interpreter
-        except ImportError as error:
-            raise RuntimeError("Instala tflite-runtime o tensorflow para usar la cámara") from error
+            from tflite_runtime.interpreter import Interpreter
+        except ImportError:
+            try:
+                from tensorflow.lite.python.interpreter import Interpreter
+            except ImportError as error:
+                raise RuntimeError("Instala ai-edge-litert, tflite-runtime o tensorflow para usar la cámara") from error
 
     _INTERPRETER = Interpreter(model_path=str(ruta_modelo))
     _INTERPRETER.allocate_tensors()

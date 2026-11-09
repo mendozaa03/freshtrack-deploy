@@ -13,6 +13,7 @@ COPY requirements-prod.txt .
 RUN pip install --no-cache-dir -r requirements-prod.txt
 
 COPY backend/app ./app
+COPY ml/modelos ./ml/modelos
 
 EXPOSE 8000
 
